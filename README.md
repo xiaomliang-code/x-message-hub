@@ -2,6 +2,7 @@
 
 [![PyPI version](https://badge.fury.io/py/x-message-hub.svg)](https://pypi.org/project/x-message-hub/)
 [![Python](https://img.shields.io/pypi/pyversions/x-message-hub)](https://pypi.org/project/x-message-hub/)
+[![Ko-fi](https://img.shields.io/badge/donate-Ko--fi-FF5E5B?logo=ko-fi)](https://ko-fi.com/jmaasnodny)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Production-grade thread-safe message bus for Python.**  
