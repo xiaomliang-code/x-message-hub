@@ -1,21 +1,24 @@
 import os
 import json
+import logging
 import time
 import threading
 import queue
 import uuid
+from dataclasses import dataclass, field
 from typing import Dict, List, Callable, Optional, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor, Future
 
 # ============================================================
-# MessageHub — 生产级消息总线 v3
-#
+# MessageHub — 生产级消息总线 v3.1
+# Author: Jason
+
 # 架构保留：
 #   三层流水线（Publisher → Dispatcher → Subscriber Worker）
 #   动态 QoS：快慢双线程池 + 超时自动降级
 #   毒丸（Poison Pill）优雅退出机制
 #
-# 缺陷修复（v2）：
+# 历史修复（v2）：
 #   [F1] 拆分四把独立锁，消除单例锁复用死锁
 #   [F2] threading.Event 替代布尔标志，保证"只执行一次"原子性
 #   [F3] stop() 先收集再清理，消除持锁调用死锁
@@ -35,7 +38,31 @@ from concurrent.futures import ThreadPoolExecutor, Future
 #   [P3] 毒丸语义分层
 #          unsubscribe() → 追尾毒丸（保证已入队消息处理完再退出）
 #          stop()        → 清空队列后再放毒丸（闪退，丢弃积压）
+#
+# 新增修复（v3.1）：
+#   [R1] try_execute() 用 Lock + bool 替代 Event 的 check-then-set，
+#        彻底消除两线程同时通过 is_set() 检查的竞态窗口
+#   [R2] IsolationRecord.TTL_SECONDS 改为实例参数，支持每个 Hub 单独配置
+#   [R3] _tail_poison() 区分 queue.Full 与其他异常，Full 时降级为 put(block=True)，
+#        确保毒丸必达，避免 unsubscribe() 后 Worker 永久阻塞
+#   [R4] stop() 执行完毕后清除 _initialized，使单例可被重新初始化，
+#        彻底解决 stop() 后无法重启的问题
+#   [R5] SubscriptionState 由匿名 Tuple 改为具名 dataclass，消除魔法索引
+#   [R6] 日志替换为 logging 模块，支持日志级别控制，避免高频 print 成为瓶颈
+#   [R7] 线程池 max_workers 增加上限保护（默认 64），防止嵌入式平台线程爆炸
+#   [R8] 消息丢弃计数器（原子），暴露 get_stats() 接口供监控使用
 # ============================================================
+
+# ---------------------------------------------------------------------------
+# 日志配置（[R6]）
+# ---------------------------------------------------------------------------
+logger = logging.getLogger("MessageHub")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s | [%(name)s] %(message)s",
+                                            datefmt="%H:%M:%S"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.DEBUG)
 
 POISON_PILL = object()
 
@@ -53,63 +80,72 @@ class TaskEntry:
     """封装单次回调任务及其执行状态"""
 
     def __init__(self, channel: str, sub_id: str, callback: Callable, message: Any):
-        self.channel    = channel
-        self.sub_id     = sub_id
-        self.callback   = callback
-        self.message    = message
-        self.submit_time: float = time.monotonic()
+        self.channel         = channel
+        self.sub_id          = sub_id
+        self.callback        = callback
+        self.message         = message
+        self.submit_time: float          = time.monotonic()
         self.executor_future: Optional[Future] = None
-        # [F2] Event.set() 是原子操作，天然满足"只执行一次"的 CAS 语义
-        self._executed = threading.Event()
+        # [R1] 用 Lock + bool 实现真正的 CAS，消除 Event 的 check-then-set 竞态
+        self._exec_lock  = threading.Lock()
+        self._executed   = False
 
     def try_execute(self) -> bool:
         """
-        CAS 语义：首个调用者 set() 成功并获得执行权，返回 True；
-        后续调用者 is_set() 已为 True，直接返回 False。
-        Event 内部有互斥锁，无竞态窗口。
+        真正的 CAS 语义：持锁检查并置位，保证"只执行一次"无竞态。
+        首个调用者将 _executed 从 False 改为 True 并返回 True（获得执行权）；
+        后续任何调用者都会看到 _executed 已为 True，返回 False。
         """
-        if self._executed.is_set():
-            return False
-        self._executed.set()
-        return True
+        with self._exec_lock:
+            if self._executed:
+                return False
+            self._executed = True
+            return True
 
 
 class ChannelState:
     """每个频道持有的完整状态：主队列、订阅者列表、分发线程"""
 
-    def __init__(self, name: str):
-        self.name         = name
-        self.master_queue : queue.Queue = queue.Queue(maxsize=10_000)
-        self.subscribers  : List[Tuple[str, queue.Queue]] = []
-        self.sub_lock     = threading.Lock()
-        self.stop_event   = threading.Event()
+    def __init__(self, name: str, master_queue_maxsize: int = 10_000):
+        self.name          = name
+        self.master_queue  = queue.Queue(maxsize=master_queue_maxsize)
+        self.subscribers   : List[Tuple[str, queue.Queue]] = []
+        self.sub_lock      = threading.Lock()
+        self.stop_event    = threading.Event()
         self.dispatcher_thread: Optional[threading.Thread] = None
 
     def start_dispatcher(self, bus: 'MessageHub') -> None:
-        if self.dispatcher_thread is None:
-            t = threading.Thread(
-                target=bus._dispatcher_worker,
-                args=(self,),
-                daemon=True,
-                name=f"Dispatcher-{self.name}",
-            )
-            self.dispatcher_thread = t
-            t.start()
+        with self.sub_lock:
+            if self.dispatcher_thread is None:
+                t = threading.Thread(
+                    target=bus._dispatcher_worker,
+                    args=(self,),
+                    daemon=True,
+                    name=f"Dispatcher-{self.name}",
+                )
+                self.dispatcher_thread = t
+                t.start()
 
 
 class IsolationRecord:
-    """[F6] 隔离记录，携带时间戳以支持 TTL 自动过期"""
-    TTL_SECONDS: float = 300.0  # 5 分钟后自动解除隔离
+    """[F6][R2] 隔离记录，携带时间戳以支持 TTL 自动过期；TTL 由实例参数控制"""
 
-    def __init__(self):
+    def __init__(self, ttl_seconds: float = 300.0):
         self.isolated_at: float = time.monotonic()
+        self._ttl = ttl_seconds
 
     def is_expired(self) -> bool:
-        return (time.monotonic() - self.isolated_at) > self.TTL_SECONDS
+        return (time.monotonic() - self.isolated_at) > self._ttl
 
 
-# SubscriptionState = (channel_name, worker_thread, sub_queue, callback, maxsize)
-SubscriptionState = Tuple[str, threading.Thread, queue.Queue, Callable, int]
+# [R5] SubscriptionState 改为具名 dataclass，消除魔法索引访问
+@dataclass
+class SubscriptionState:
+    channel_name : str
+    worker_thread: threading.Thread
+    sub_queue    : queue.Queue
+    callback     : Callable
+    queue_maxsize: int
 
 
 # ==================== [P1] 序列化工具函数 ====================
@@ -131,11 +167,9 @@ def _encode_message(obj: Any, copy_arrays: bool = False) -> Any:
     档位 4 — 其他类型
         json.dumps fallback，无法序列化时抛出 TypeError。
     """
-    # 档位 1：已是字节，直接返回
     if isinstance(obj, (bytes, bytearray)):
         return obj
 
-    # 档位 2：numpy 数组，传引用或拷贝
     if _NUMPY_AVAILABLE and isinstance(obj, np.ndarray):
         if copy_arrays:
             return obj.copy()
@@ -143,13 +177,12 @@ def _encode_message(obj: Any, copy_arrays: bool = False) -> Any:
         obj.flags.writeable = False
         return obj
 
-    # 档位 3：JSON 可序列化类型
     if isinstance(obj, str):
         return obj.encode('utf-8')
     if isinstance(obj, (dict, list)):
         return json.dumps(obj, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
 
-    # 档位 4：fallback
+    # fallback
     return json.dumps({"data": obj}, default=str, separators=(',', ':')).encode('utf-8')
 
 
@@ -163,16 +196,16 @@ def _decode_message(raw: Any) -> Any:
         return raw
     if isinstance(raw, bytearray):
         return raw
-    if isinstance(raw, (bytes,)):
+    if isinstance(raw, bytes):
         try:
             decoded = raw.decode('utf-8')
         except UnicodeDecodeError:
-            return raw  # 二进制内容，原样返回
+            return raw
         try:
             return json.loads(decoded)
         except json.JSONDecodeError:
             return decoded
-    return raw  # 其他类型透传
+    return raw
 
 
 # ==================== [P3] 毒丸辅助函数 ====================
@@ -192,21 +225,29 @@ def _drain_and_poison(sub_queue: queue.Queue) -> None:
     try:
         sub_queue.put_nowait(POISON_PILL)
     except queue.Full:
-        # 队列满说明刚才 drain 后又有新消息进来（极罕见），强制放入
+        # 极罕见：drain 后又有新消息进来，强制阻塞放入
         sub_queue.put(POISON_PILL, block=True)
     if drained:
-        _log(f"[drain] 闪退模式丢弃 {drained} 条积压消息")
+        logger.debug("[drain] 闪退模式丢弃 %d 条积压消息", drained)
 
 
 def _tail_poison(sub_queue: queue.Queue) -> None:
     """
-    优雅退出模式（用于 unsubscribe()）：
+    [R3] 优雅退出模式（用于 unsubscribe()）：
     毒丸追加到队尾，Worker 处理完所有已入队消息后才退出。
+    区分 queue.Full（降级为阻塞 put，确保毒丸必达）与其他异常（记录日志）。
     """
     try:
-        sub_queue.put(POISON_PILL)
-    except Exception:
-        pass
+        sub_queue.put_nowait(POISON_PILL)
+    except queue.Full:
+        # 队列满时改为阻塞等待，确保毒丸一定能送达
+        logger.warning("[tail_poison] 订阅队列已满，阻塞等待投入毒丸...")
+        try:
+            sub_queue.put(POISON_PILL, block=True, timeout=10)
+        except Exception as e:
+            logger.error("[tail_poison] 毒丸投递失败，Worker 可能无法正常退出: %s", e)
+    except Exception as e:
+        logger.error("[tail_poison] 意外异常: %s", e)
 
 
 # ==================== 核心事件总线 ====================
@@ -244,10 +285,13 @@ class MessageHub:
 
     def __init__(
         self,
-        slow_threshold_ms: float = 15.0,   # [F7] QoS 超时阈值，毫秒
-        fast_pool_multiplier: int = 8,      # FastPool = cpu × multiplier
-        slow_pool_multiplier: int = 2,      # SlowPool = cpu × multiplier
-        copy_arrays: bool = False,          # [P1] numpy 数组是否强制拷贝
+        slow_threshold_ms   : float = 15.0,   # [F7] QoS 超时阈值，毫秒
+        fast_pool_multiplier: int   = 8,       # FastPool = min(cpu × multiplier, max_pool_size)
+        slow_pool_multiplier: int   = 2,       # SlowPool = min(cpu × multiplier, max_pool_size)
+        max_pool_size       : int   = 64,      # [R7] 线程池上限，防止嵌入式平台线程爆炸
+        copy_arrays         : bool  = False,   # [P1] numpy 数组是否强制拷贝
+        isolation_ttl_s     : float = 300.0,   # [R2] 隔离记录 TTL，秒
+        master_queue_maxsize: int   = 10_000,  # 每个频道主队列深度
     ):
         if hasattr(self, "_initialized"):
             return
@@ -258,30 +302,40 @@ class MessageHub:
         self._sub_lock       = threading.Lock()   # 保护 _subscriptions
         self._isolation_lock = threading.Lock()   # 保护 _isolated_subs
 
-        self._channels:      Dict[str, ChannelState]      = {}
+        self._channels     : Dict[str, ChannelState]      = {}
         self._subscriptions: Dict[str, SubscriptionState] = {}
 
         # [F7] 阈值转换为秒
-        self.SLOW_THRESHOLD: float = slow_threshold_ms / 1000.0
-        # [P1] numpy 数组拷贝策略
-        self._copy_arrays: bool = copy_arrays
+        self.SLOW_THRESHOLD     : float = slow_threshold_ms / 1000.0
+        self._copy_arrays       : bool  = copy_arrays
+        self._isolation_ttl_s   : float = isolation_ttl_s
+        self._master_queue_maxsize: int = master_queue_maxsize
 
         # [F6] 隔离表
         self._isolated_subs: Dict[str, IsolationRecord] = {}
 
-        # 线程池
+        # [R8] 消息丢弃计数器（用 threading.Lock 保护原子递增）
+        self._stats_lock        = threading.Lock()
+        self._dropped_master    = 0   # 主队列满丢弃
+        self._dropped_sub       = 0   # 订阅者队列满丢弃
+        self._dropped_encode    = 0   # 序列化失败丢弃
+
+        # [R7] 线程池大小加上限保护
         cpu = os.cpu_count() or 4
+        fast_workers = min(cpu * fast_pool_multiplier, max_pool_size)
+        slow_workers = min(cpu * slow_pool_multiplier, max_pool_size)
+
         self._fast_executor = ThreadPoolExecutor(
-            max_workers=cpu * fast_pool_multiplier,
+            max_workers=fast_workers,
             thread_name_prefix="FastWorker",
         )
         self._slow_executor = ThreadPoolExecutor(
-            max_workers=cpu * slow_pool_multiplier,
+            max_workers=slow_workers,
             thread_name_prefix="SlowWorker",
         )
 
         # QoS 监控线程
-        self._monitor_queue: queue.Queue[TaskEntry] = queue.Queue()
+        self._monitor_queue : queue.Queue = queue.Queue()
         self._monitor_stop  = threading.Event()
         self._monitor_thread = threading.Thread(
             target=self._monitor_worker, daemon=True, name="QoS-Monitor"
@@ -295,14 +349,48 @@ class MessageHub:
         )
         self._cleanup_thread.start()
 
-        _log(
-            f"MessageHub v3 已初始化 | "
-            f"QoS阈值={slow_threshold_ms}ms | "
-            f"FastPool={cpu * fast_pool_multiplier} | "
-            f"SlowPool={cpu * slow_pool_multiplier} | "
-            f"numpy={'可用' if _NUMPY_AVAILABLE else '不可用'} | "
-            f"copy_arrays={copy_arrays}"
+        logger.info(
+            "MessageHub v3.1 已初始化 | QoS阈值=%.1fms | FastPool=%d | SlowPool=%d | "
+            "numpy=%s | copy_arrays=%s | isolation_ttl=%.0fs",
+            slow_threshold_ms, fast_workers, slow_workers,
+            "可用" if _NUMPY_AVAILABLE else "不可用", copy_arrays, isolation_ttl_s,
         )
+
+    # ------------------------------------------------------------------
+    # [R8] 统计接口
+    # ------------------------------------------------------------------
+
+    def get_stats(self) -> Dict[str, int]:
+        """
+        返回运行期间的消息丢弃统计，供外部监控系统采集。
+
+        Returns:
+            {
+              "dropped_master": 主队列满丢弃数,
+              "dropped_sub":    订阅者队列满丢弃数,
+              "dropped_encode": 序列化失败丢弃数,
+              "isolated_subs":  当前处于隔离状态的订阅者数,
+            }
+        """
+        with self._stats_lock:
+            d_master  = self._dropped_master
+            d_sub     = self._dropped_sub
+            d_encode  = self._dropped_encode
+        with self._isolation_lock:
+            n_iso = len(self._isolated_subs)
+        return {
+            "dropped_master" : d_master,
+            "dropped_sub"    : d_sub,
+            "dropped_encode" : d_encode,
+            "isolated_subs"  : n_iso,
+        }
+
+    def reset_stats(self) -> None:
+        """将统计计数器清零（例如每分钟采集后重置）"""
+        with self._stats_lock:
+            self._dropped_master = 0
+            self._dropped_sub    = 0
+            self._dropped_encode = 0
 
     # ------------------------------------------------------------------
     # 隔离表管理
@@ -315,32 +403,31 @@ class MessageHub:
                 return False
             if rec.is_expired():
                 del self._isolated_subs[sub_id]
-                _log(f"[Isolation] Sub [{sub_id[:8]}] TTL 到期，自动解除隔离")
+                logger.info("[Isolation] Sub [%s] TTL 到期，自动解除隔离", sub_id[:8])
                 return False
             return True
 
     def _set_isolated(self, sub_id: str) -> None:
         with self._isolation_lock:
-            self._isolated_subs[sub_id] = IsolationRecord()
+            self._isolated_subs[sub_id] = IsolationRecord(ttl_seconds=self._isolation_ttl_s)
 
     # [F6] 定时清理过期隔离记录，防止内存泄漏
     def _isolation_cleanup_worker(self) -> None:
         while not self._cleanup_stop.is_set():
-            # 用 wait 代替 sleep，stop 时可立即唤醒
             self._cleanup_stop.wait(timeout=60)
             with self._isolation_lock:
                 expired = [sid for sid, rec in self._isolated_subs.items() if rec.is_expired()]
                 for sid in expired:
                     del self._isolated_subs[sid]
             if expired:
-                _log(f"[IsoCleanup] 清理 {len(expired)} 条过期隔离记录")
+                logger.info("[IsoCleanup] 清理 %d 条过期隔离记录", len(expired))
 
     # ------------------------------------------------------------------
     # QoS 任务执行入口
     # ------------------------------------------------------------------
 
     def _execute_task(self, task: TaskEntry) -> None:
-        """[F2] 唯一执行入口，try_execute() 保证回调只被调用一次"""
+        """[R1] 唯一执行入口，try_execute() 的真正 CAS 保证回调只被调用一次"""
         if not task.try_execute():
             return
         try:
@@ -351,7 +438,7 @@ class MessageHub:
                 if isinstance(task.message, dict)
                 else 'N/A'
             )
-            _log(f"[Callback ERROR] ch={task.channel} id={msg_id} err={e}")
+            logger.error("[Callback ERROR] ch=%s id=%s err=%s", task.channel, msg_id, e)
 
     # ------------------------------------------------------------------
     # [P2] QoS Monitor —— 纯依赖 queue.get 阻塞，不再有 time.sleep
@@ -359,7 +446,6 @@ class MessageHub:
 
     def _monitor_worker(self) -> None:
         while not self._monitor_stop.is_set():
-            # [P2] timeout 控制轮询间隔，队列空时挂起，不消耗 CPU
             try:
                 task: TaskEntry = self._monitor_queue.get(timeout=0.005)
             except queue.Empty:
@@ -368,7 +454,6 @@ class MessageHub:
             try:
                 future = task.executor_future
                 if future is None or future.done():
-                    # 任务已在 Fast Pool 正常完成，无需干预
                     continue
 
                 elapsed = time.monotonic() - task.submit_time
@@ -379,21 +464,20 @@ class MessageHub:
                     continue
 
                 # ---- 超时：触发 QoS 降级 ----
-                _log(
-                    f"[QoS] Sub [{task.sub_id[:8]}] 超时 {elapsed * 1000:.1f}ms，"
-                    f"永久降级到慢速池"
+                logger.warning(
+                    "[QoS] Sub [%s] 超时 %.1fms，永久降级到慢速池",
+                    task.sub_id[:8], elapsed * 1000,
                 )
                 self._set_isolated(task.sub_id)
 
                 if future.cancel():
-                    # [F4] cancel() 成功（任务尚未开始）→ 转交慢速池执行
+                    # cancel() 成功（任务尚未开始）→ 转交慢速池执行
                     self._slow_executor.submit(self._execute_task, task)
-                # cancel() 失败表示任务已在 Fast Pool 运行中，让它跑完即可
-                # try_execute() 保证不会双重执行
+                # cancel() 失败表示任务已在 Fast Pool 运行中，让它跑完
+                # try_execute() 的 CAS 保证不会双重执行
 
             finally:
                 self._monitor_queue.task_done()
-            # [P2] 删除原来的 time.sleep(0.00001)，此处无需额外等待
 
     # ------------------------------------------------------------------
     # Dispatcher（Tier 2）：从主队列扇出到各订阅者队列
@@ -415,13 +499,15 @@ class MessageHub:
                     try:
                         sub_queue.put_nowait(raw)
                     except queue.Full:
-                        _log(
-                            f"[Dispatcher-{channel.name}] "
-                            f"Sub [{sub_id[:8]}] 队列满（max={sub_queue.maxsize}），消息丢弃"
+                        with self._stats_lock:
+                            self._dropped_sub += 1
+                        logger.warning(
+                            "[Dispatcher-%s] Sub [%s] 队列满（max=%d），消息丢弃",
+                            channel.name, sub_id[:8], sub_queue.maxsize,
                         )
             except Exception as e:
                 if not channel.stop_event.is_set():
-                    _log(f"[Dispatcher-{channel.name}] 异常: {e}")
+                    logger.error("[Dispatcher-%s] 异常: %s", channel.name, e)
             finally:
                 channel.master_queue.task_done()
 
@@ -432,9 +518,9 @@ class MessageHub:
     def _subscriber_worker(
         self,
         channel_name: str,
-        sub_id: str,
-        sub_queue: queue.Queue,
-        callback: Callable[[str, Any], None],
+        sub_id      : str,
+        sub_queue   : queue.Queue,
+        callback    : Callable[[str, Any], None],
     ) -> None:
         threading.current_thread().name = f"Sub-{sub_id[:8]}"
 
@@ -448,17 +534,16 @@ class MessageHub:
                 if raw is POISON_PILL:
                     break
 
-                # 反序列化
                 try:
                     msg = _decode_message(raw)
                 except Exception as e:
-                    _log(f"[{threading.current_thread().name}] 解码失败: {e}")
+                    logger.error("[%s] 解码失败: %s", threading.current_thread().name, e)
                     continue
 
                 task = TaskEntry(channel_name, sub_id, callback, msg)
 
                 if self._is_isolated(sub_id):
-                    # 已降级：直接走慢速池，跳过监控
+                    # 已降级：直接走慢速池，跳过 Monitor
                     self._slow_executor.submit(self._execute_task, task)
                 else:
                     future = self._fast_executor.submit(self._execute_task, task)
@@ -466,28 +551,28 @@ class MessageHub:
                     self._monitor_queue.put(task)
 
             except Exception as e:
-                _log(f"[{threading.current_thread().name}] 致命异常: {e}")
+                logger.error("[%s] 致命异常: %s", threading.current_thread().name, e)
             finally:
                 sub_queue.task_done()
 
         # Worker 退出前从订阅表自我移除
         with self._sub_lock:
             self._subscriptions.pop(sub_id, None)
-        _log(f"Sub Worker [{sub_id[:8]}] 已退出")
+        logger.debug("Sub Worker [%s] 已退出", sub_id[:8])
 
     # ------------------------------------------------------------------
     # 频道管理
     # ------------------------------------------------------------------
 
     def _get_or_create_channel(self, key: str) -> ChannelState:
-        # 快速路径：无锁读
+        # 快速路径：依赖 GIL 保证 dict.get() 原子性，无需加锁
         ch = self._channels.get(key)
         if ch is not None:
             return ch
-        # 慢速路径：[F1] 使用独立的频道锁
+        # 慢速路径：[F1] 使用独立的频道锁，double-checked locking
         with self._channel_lock:
             if key not in self._channels:
-                self._channels[key] = ChannelState(key)
+                self._channels[key] = ChannelState(key, self._master_queue_maxsize)
             return self._channels[key]
 
     # ------------------------------------------------------------------
@@ -496,8 +581,8 @@ class MessageHub:
 
     def subscribe(
         self,
-        keys: List[str],
-        callback: Callable[[str, Any], None],
+        keys         : List[str],
+        callback     : Callable[[str, Any], None],
         queue_maxsize: int = 1000,
     ) -> Dict[str, str]:
         """
@@ -512,31 +597,40 @@ class MessageHub:
         Returns:
             {channel_key: sub_id} 映射，sub_id 用于后续 unsubscribe()
         """
-        result:           Dict[str, str]          = {}
-        workers_to_start: List[threading.Thread]  = []
+        result          : Dict[str, str]         = {}
+        workers_to_start: List[threading.Thread] = []
 
         for key in keys:
-            channel   = self._get_or_create_channel(key)
+            channel  = self._get_or_create_channel(key)
             channel.start_dispatcher(self)
 
             sub_id    = str(uuid.uuid4())
-            sub_queue : queue.Queue = queue.Queue(maxsize=queue_maxsize)
+            sub_queue = queue.Queue(maxsize=queue_maxsize)
 
             worker = threading.Thread(
                 target=self._subscriber_worker,
                 args=(key, sub_id, sub_queue, callback),
                 daemon=True,
+                name=f"Sub-{sub_id[:8]}",
+            )
+
+            state = SubscriptionState(
+                channel_name=key,
+                worker_thread=worker,
+                sub_queue=sub_queue,
+                callback=callback,
+                queue_maxsize=queue_maxsize,
             )
 
             with self._sub_lock:
-                self._subscriptions[sub_id] = (key, worker, sub_queue, callback, queue_maxsize)
+                self._subscriptions[sub_id] = state
 
             with channel.sub_lock:
                 channel.subscribers.append((sub_id, sub_queue))
 
             result[key] = sub_id
             workers_to_start.append(worker)
-            _log(f"subscribe: ch={key} sub={sub_id[:8]} maxsize={queue_maxsize}")
+            logger.debug("subscribe: ch=%s sub=%s maxsize=%d", key, sub_id[:8], queue_maxsize)
 
         for w in workers_to_start:
             w.start()
@@ -559,7 +653,9 @@ class MessageHub:
         try:
             data = _encode_message(obj, copy_arrays=self._copy_arrays)
         except Exception as e:
-            _log(f"[send_message] 序列化失败 ch={key}: {e}")
+            with self._stats_lock:
+                self._dropped_encode += 1
+            logger.error("[send_message] 序列化失败 ch=%s: %s", key, e)
             return False
 
         channel = self._get_or_create_channel(key)
@@ -567,33 +663,36 @@ class MessageHub:
             channel.master_queue.put(data, block=block)
             return True
         except queue.Full:
-            _log(f"[send_message] 频道 [{key}] 主队列已满，消息丢弃")
+            with self._stats_lock:
+                self._dropped_master += 1
+            logger.warning("[send_message] 频道 [%s] 主队列已满，消息丢弃", key)
             return False
 
     def unsubscribe(self, sub_id: str) -> None:
         """
-        [P3] 优雅退订：毒丸追加到队尾，Worker 处理完已入队消息后退出。
-        适合业务模块主动注销，已发出的消息不会丢失。
+        [P3][R3] 优雅退订：毒丸追加到队尾，Worker 处理完已入队消息后退出。
+        _tail_poison() 保证毒丸必达，避免 Worker 永久阻塞。
         """
         with self._sub_lock:
             state = self._subscriptions.pop(sub_id, None)
         if state is None:
             return
 
-        channel_name, worker_thread, sub_queue, _, _ = state
-
         # 从 Dispatcher 列表摘除（先摘除，防止新消息继续写入）
-        channel = self._channels.get(channel_name)
+        channel = self._channels.get(state.channel_name)
         if channel:
             with channel.sub_lock:
                 channel.subscribers = [
                     (s, q) for s, q in channel.subscribers if s != sub_id
                 ]
 
-        # 毒丸追尾：处理完已有消息再退出
-        _tail_poison(sub_queue)
-        worker_thread.join(timeout=5)
-        _log(f"unsubscribe: sub={sub_id[:8]}")
+        # [R3] 毒丸追尾：确保必达，处理完已有消息再退出
+        _tail_poison(state.sub_queue)
+        state.worker_thread.join(timeout=5)
+        if state.worker_thread.is_alive():
+            logger.warning("unsubscribe: sub=%s Worker 未能在 5s 内退出", sub_id[:8])
+        else:
+            logger.debug("unsubscribe: sub=%s", sub_id[:8])
 
     def stop(self) -> None:
         """
@@ -605,14 +704,15 @@ class MessageHub:
           3. 所有 Dispatcher（不再从主队列读取）
           4. 所有 Subscriber Worker（[P3] 清空积压后闪退）[F8] 并行 join
           5. 关闭线程池
+          6. [R4] 清除 _initialized，允许单例重新初始化
         """
-        _log("MessageHub 正在停止...")
+        logger.info("MessageHub 正在停止...")
 
         # 1. 停止 QoS Monitor
         self._monitor_stop.set()
         self._monitor_thread.join(timeout=3)
 
-        # 2. 停止隔离清理线程（用 set() 立即唤醒 wait()）
+        # 2. 停止隔离清理线程（set() 立即唤醒 wait()）
         self._cleanup_stop.set()
         self._cleanup_thread.join(timeout=3)
 
@@ -623,7 +723,7 @@ class MessageHub:
             if ch.dispatcher_thread and ch.dispatcher_thread.is_alive():
                 ch.dispatcher_thread.join(timeout=3)
 
-        # 4. [F3] 先在锁外收集列表，避免持锁时调用清理逻辑造成死锁
+        # 4. [F3] 先在锁内收集 sub_id 列表，锁外执行清理，避免持锁死锁
         with self._sub_lock:
             active_subs = list(self._subscriptions.keys())
 
@@ -635,10 +735,7 @@ class MessageHub:
             if state is None:
                 continue
 
-            channel_name, worker_thread, sub_queue, _, _ = state
-
-            # 从 Dispatcher 列表摘除
-            ch = self._channels.get(channel_name)
+            ch = self._channels.get(state.channel_name)
             if ch:
                 with ch.sub_lock:
                     ch.subscribers = [
@@ -646,8 +743,8 @@ class MessageHub:
                     ]
 
             # [P3] 闪退模式：清空积压 → 放毒丸
-            _drain_and_poison(sub_queue)
-            worker_threads.append(worker_thread)
+            _drain_and_poison(state.sub_queue)
+            worker_threads.append(state.worker_thread)
 
         # [F8] 并行等待所有 Worker 退出
         for t in worker_threads:
@@ -657,19 +754,18 @@ class MessageHub:
         self._fast_executor.shutdown(wait=True, cancel_futures=True)
         self._slow_executor.shutdown(wait=True, cancel_futures=True)
 
-        _log("MessageHub 已完全停止")
+        # 6. [R4] 清除初始化标志，使单例在下次构造时可以重新初始化
+        if hasattr(self, "_initialized"):
+            del self._initialized
 
-
-# ==================== 简易日志 ====================
-
-def _log(msg: str) -> None:
-    ts = time.strftime("%H:%M:%S")
-    print(f"{ts} | [MessageHub] {msg}", flush=True)
+        logger.info("MessageHub 已完全停止")
 
 
 # ==================== 使用示例 ====================
 
 if __name__ == "__main__":
+
+    logging.basicConfig(level=logging.DEBUG)
 
     MessageHub._reset_instance()
     bus = MessageHub(slow_threshold_ms=15.0, copy_arrays=False)
@@ -698,13 +794,13 @@ if __name__ == "__main__":
     def numpy_handler(channel: str, message: Any) -> None:
         """[P1] 演示 numpy 数组零拷贝接收"""
         if _NUMPY_AVAILABLE and isinstance(message, np.ndarray):
-            print(f"  [NUMPY] shape={message.shape} dtype={message.dtype} writeable={message.flags.writeable}")
+            print(f"  [NUMPY] shape={message.shape} dtype={message.dtype} "
+                  f"writeable={message.flags.writeable}")
         else:
             print(f"  [NUMPY] 收到非数组消息: {type(message)}")
 
     # ── 注册订阅 ──────────────────────────────────────────
 
-    # [F5] 三组独立订阅，各有独立队列和回调
     fast_subs  = bus.subscribe(["sensor_data", "control_cmd"], fast_processor, queue_maxsize=2000)
     slow_subs  = bus.subscribe(["sensor_data"],                slow_storage,   queue_maxsize=15000)
     cmd_subs   = bus.subscribe(["control_cmd"],                cmd_handler,    queue_maxsize=500)
@@ -713,40 +809,53 @@ if __name__ == "__main__":
     time.sleep(0.3)  # 等待所有 Worker 就绪
 
     # ── 场景 A：普通 dict 消息（JSON 序列化）────────────────
-    _log("=== 场景 A：普通指令消息（JSON） ===")
+    logger.info("=== 场景 A：普通指令消息（JSON） ===")
     for i in range(1, 20):
         bus.send_message("control_cmd", {"id": i, "data": f"cmd_{i}"})
 
     # ── 场景 B：触发 QoS 降级 ────────────────────────────────
-    _log("=== 场景 B：触发 QoS 降级 ===")
+    logger.info("=== 场景 B：触发 QoS 降级 ===")
     bus.send_message("sensor_data", {"id": 101, "trigger_slow": True})
     bus.send_message("sensor_data", {"id": 102, "trigger_slow": True})
 
     # ── 场景 C：观察隔离后的慢速池路由 ──────────────────────
-    _log("=== 场景 C：观察隔离后的慢速池路由 ===")
+    logger.info("=== 场景 C：观察隔离后的慢速池路由 ===")
     for i in range(103, 160):
         bus.send_message("sensor_data", {"id": i, "data": f"sensor_{i}"})
 
     # ── 场景 D：[P1] numpy 数组零拷贝传递 ───────────────────
     if _NUMPY_AVAILABLE:
-        _log("=== 场景 D：numpy 数组零拷贝 ===")
+        logger.info("=== 场景 D：numpy 数组零拷贝 ===")
         frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
         bus.send_message("camera_frame", frame)
-        # 数组已被标记为只读，发送后修改会抛出 ValueError（保护语义）
         try:
             frame[0, 0, 0] = 99
         except ValueError as e:
-            _log(f"[P1 验证] 零拷贝只读保护生效: {e}")
+            logger.info("[P1 验证] 零拷贝只读保护生效: %s", e)
     else:
-        _log("=== 场景 D：跳过（numpy 未安装）===")
+        logger.info("=== 场景 D：跳过（numpy 未安装）===")
 
-    _log("所有消息已发送，等待处理完毕...")
+    logger.info("所有消息已发送，等待处理完毕...")
     time.sleep(5)
 
-    # ── 场景 E：[P3] 验证 stop() 闪退语义 ──────────────────
-    _log("=== 场景 E：发送大量积压消息后立即 stop()（闪退验证）===")
+    # ── 场景 E：[R8] 查看统计信息 ───────────────────────────
+    logger.info("=== 场景 E：统计信息 ===")
+    stats = bus.get_stats()
+    logger.info("消息统计: %s", stats)
+
+    # ── 场景 F：[R4] 验证 stop() 后可重新初始化 ─────────────
+    logger.info("=== 场景 F：发送大量积压消息后立即 stop()（闪退验证）===")
     for i in range(500, 600):
         bus.send_message("sensor_data", {"id": i, "data": f"flood_{i}"})
 
     bus.stop()
-    _log("主线程退出")
+    logger.info("stop() 完成，验证单例可重启...")
+
+    # [R4] stop() 后重新初始化，不再返回已停止的实例
+    bus2 = MessageHub(slow_threshold_ms=20.0)
+    assert bus2 is bus, "单例指针应相同"
+    assert hasattr(bus2, "_initialized"), "重新初始化应成功"
+    logger.info("[R4 验证] 单例重启成功，新阈值=20ms")
+    bus2.stop()
+
+    logger.info("主线程退出")
