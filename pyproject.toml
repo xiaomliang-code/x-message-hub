@@ -36,9 +36,9 @@ numpy = ["numpy>=1.21"]
 dev   = ["numpy>=1.21", "pytest>=7.0", "twine", "build"]
 
 [project.urls]
-Homepage   = "https://github.com/your-username/x-message-hub"
-Repository = "https://github.com/your-username/x-message-hub"
-Issues     = "https://github.com/your-username/x-message-hub/issues"
+Homepage   = "https://github.com/xiaomliang-code/x-message-hub"
+Repository = "https://github.com/xiaomliang-code/x-message-hub"
+Issues     = "https://github.com/xiaomliang-code/x-message-hub/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
